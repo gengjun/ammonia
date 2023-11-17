@@ -27,7 +27,6 @@
 //! [html5ever]: https://github.com/servo/html5ever "The HTML parser in Servo"
 //! [pulldown-cmark]: https://github.com/google/pulldown-cmark "CommonMark parser"
 
-
 #[cfg(ammonia_unstable)]
 pub mod rcdom;
 
@@ -362,6 +361,7 @@ pub struct Builder<'a> {
     url_schemes: HashSet<&'a str>,
     url_relative: UrlRelative<'a>,
     attribute_filter: Option<Box<dyn AttributeFilter>>,
+    attribute_breaker: Option<Box<dyn AttributeBreaker>>,
     link_rel: Option<&'a str>,
     allowed_classes: HashMap<&'a str, HashSet<&'a str>>,
     strip_comments: bool,
@@ -482,6 +482,7 @@ impl<'a> Default for Builder<'a> {
             url_schemes,
             url_relative: UrlRelative::PassThrough,
             attribute_filter: None,
+            attribute_breaker: None,
             link_rel: Some("noopener noreferrer"),
             allowed_classes,
             strip_comments: true,
@@ -1383,6 +1384,47 @@ impl<'a> Builder<'a> {
         self
     }
 
+    /// Allows stop parsing and return error msg when element, attribute and its value match
+    /// the given inputs.
+    ///
+    /// The callback takes name of the element, attribute and its value.
+    ///
+    /// # Panics
+    ///
+    /// If more than one callback is set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ammonia::Builder;
+    /// let a = Builder::new()
+    ///     .attribute_breaker(|element, attribute, value| {
+    ///         match (element, attribute) {
+    ///             ("img", "src") => match value {
+    ///                 "very.bad.com" => "forbidden",
+    ///                 _ => Ok(()),
+    ///             },
+    ///             _ => Ok(()),
+    ///         }
+    ///     })
+    ///     .link_rel(None)
+    ///     .clean("<a href=/><img alt=Home src=foo></a>")
+    ///     .to_string();
+    /// assert_eq!(a,
+    ///     r#"<a href="/"><img alt="Home"></a>"#);
+    /// ```
+    pub fn attribute_breaker<'cb, CallbackFn>(&mut self, callback: CallbackFn) -> &mut Self
+    where
+        CallbackFn:
+            for<'u> Fn(&str, &str, &'u str) -> Result<(), &'static str> + Send + Sync + 'static,
+    {
+        assert!(
+            self.attribute_breaker.is_none(),
+            "attribute_breaker can be set only once"
+        );
+        self.attribute_breaker = Some(Box::new(callback));
+        self
+    }
     /// Returns `true` if the relative URL resolver is set to `Deny`.
     ///
     /// # Examples
@@ -1728,9 +1770,18 @@ impl<'a> Builder<'a> {
     pub fn clean(&self, src: &str) -> Document {
         let parser = Self::make_parser();
         let dom = parser.one(src);
-        self.clean_dom(dom)
+        match self.clean_dom(dom) {
+            Ok(doc) => doc,
+            Err(_) => Document(RcDom::default()),
+        }
     }
 
+    /// Similar to clean(), but return with Result<Document, &'static str>
+    pub fn clean_break(&self, src: &str) -> Result<Document, &'static str> {
+        let parser = Self::make_parser();
+        let dom = parser.one(src);
+        self.clean_dom(dom)
+    }
     /// Sanitizes an HTML fragment from a reader according to the configured options.
     ///
     /// The input should be in UTF-8 encoding, otherwise the decoding is lossy, just
@@ -1758,7 +1809,10 @@ impl<'a> Builder<'a> {
     {
         let parser = Self::make_parser().from_utf8();
         let dom = parser.read_from(&mut src)?;
-        Ok(self.clean_dom(dom))
+        Ok(match self.clean_dom(dom) {
+            Ok(doc) => doc,
+            Err(_) => Document(RcDom::default()),
+        })
     }
 
     /// Clean a post-parsing DOM.
@@ -1766,7 +1820,7 @@ impl<'a> Builder<'a> {
     /// This is not a public API because RcDom isn't really stable.
     /// We want to be able to take breaking changes to html5ever itself
     /// without having to break Ammonia's API.
-    fn clean_dom(&self, mut dom: RcDom) -> Document {
+    fn clean_dom(&self, mut dom: RcDom) -> Result<Document, &'static str> {
         let mut stack = Vec::new();
         let mut removed = Vec::new();
         let link_rel = self
@@ -1816,7 +1870,7 @@ impl<'a> Builder<'a> {
             let pass_clean = self.clean_child(&mut node);
             let pass = pass_clean && self.check_expected_namespace(&parent, &node);
             if pass {
-                self.adjust_node_attributes(&mut node, &link_rel, self.id_prefix);
+                self.adjust_node_attributes(&mut node, &link_rel, self.id_prefix)?;
                 dom.append(&parent.clone(), NodeOrText::AppendNode(node.clone()));
             } else {
                 for sub in node.children.borrow_mut().iter_mut() {
@@ -1838,7 +1892,7 @@ impl<'a> Builder<'a> {
         while let Some(node) = removed.pop() {
             removed.extend_from_slice(&mem::take(&mut *node.children.borrow_mut())[..]);
         }
-        Document(dom)
+        Ok(Document(dom))
     }
 
     /// Returns `true` if a node and all its content should be removed.
@@ -2054,7 +2108,7 @@ impl<'a> Builder<'a> {
         child: &mut Handle,
         link_rel: &Option<StrTendril>,
         id_prefix: Option<&'a str>,
-    ) {
+    ) -> Result<(), &'static str> {
         if let NodeData::Element {
             ref name,
             ref attrs,
@@ -2119,6 +2173,12 @@ impl<'a> Builder<'a> {
                     attrs.swap_remove(i);
                 }
             }
+            if let Some(ref attr_breaker) = self.attribute_breaker {
+                let attrs = attrs.borrow_mut();
+                for attr in attrs.iter() {
+                    attr_breaker.filter(&*name.local, &*attr.name.local, &*attr.value)?;
+                }
+            }
             {
                 let mut drop_attrs = Vec::new();
                 let mut attrs = attrs.borrow_mut();
@@ -2157,6 +2217,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     /// Initializes an HTML fragment parser.
@@ -2189,271 +2250,271 @@ fn is_svg_tag(element: &str) -> bool {
     // https://svgwg.org/svg2-draft/eltindex.html
     matches!(
         element,
-        "a"
-        | "animate"
-        | "animateMotion"
-        | "animateTransform"
-        | "circle"
-        | "clipPath"
-        | "defs"
-        | "desc"
-        | "discard"
-        | "ellipse"
-        | "feBlend"
-        | "feColorMatrix"
-        | "feComponentTransfer"
-        | "feComposite"
-        | "feConvolveMatrix"
-        | "feDiffuseLighting"
-        | "feDisplacementMap"
-        | "feDistantLight"
-        | "feDropShadow"
-        | "feFlood"
-        | "feFuncA"
-        | "feFuncB"
-        | "feFuncG"
-        | "feFuncR"
-        | "feGaussianBlur"
-        | "feImage"
-        | "feMerge"
-        | "feMergeNode"
-        | "feMorphology"
-        | "feOffset"
-        | "fePointLight"
-        | "feSpecularLighting"
-        | "feSpotLight"
-        | "feTile"
-        | "feTurbulence"
-        | "filter"
-        | "foreignObject"
-        | "g"
-        | "image"
-        | "line"
-        | "linearGradient"
-        | "marker"
-        | "mask"
-        | "metadata"
-        | "mpath"
-        | "path"
-        | "pattern"
-        | "polygon"
-        | "polyline"
-        | "radialGradient"
-        | "rect"
-        | "script"
-        | "set"
-        | "stop"
-        | "style"
-        | "svg"
-        | "switch"
-        | "symbol"
-        | "text"
-        | "textPath"
-        | "title"
-        | "tspan"
-        | "use"
-        | "view"
+        "a" | "animate"
+            | "animateMotion"
+            | "animateTransform"
+            | "circle"
+            | "clipPath"
+            | "defs"
+            | "desc"
+            | "discard"
+            | "ellipse"
+            | "feBlend"
+            | "feColorMatrix"
+            | "feComponentTransfer"
+            | "feComposite"
+            | "feConvolveMatrix"
+            | "feDiffuseLighting"
+            | "feDisplacementMap"
+            | "feDistantLight"
+            | "feDropShadow"
+            | "feFlood"
+            | "feFuncA"
+            | "feFuncB"
+            | "feFuncG"
+            | "feFuncR"
+            | "feGaussianBlur"
+            | "feImage"
+            | "feMerge"
+            | "feMergeNode"
+            | "feMorphology"
+            | "feOffset"
+            | "fePointLight"
+            | "feSpecularLighting"
+            | "feSpotLight"
+            | "feTile"
+            | "feTurbulence"
+            | "filter"
+            | "foreignObject"
+            | "g"
+            | "image"
+            | "line"
+            | "linearGradient"
+            | "marker"
+            | "mask"
+            | "metadata"
+            | "mpath"
+            | "path"
+            | "pattern"
+            | "polygon"
+            | "polyline"
+            | "radialGradient"
+            | "rect"
+            | "script"
+            | "set"
+            | "stop"
+            | "style"
+            | "svg"
+            | "switch"
+            | "symbol"
+            | "text"
+            | "textPath"
+            | "title"
+            | "tspan"
+            | "use"
+            | "view"
     )
 }
 
 /// Given an element name, check if it's Math
 fn is_mathml_tag(element: &str) -> bool {
     // https://svgwg.org/svg2-draft/eltindex.html
-    matches!(element,
+    matches!(
+        element,
         "abs"
-        | "and"
-        | "annotation"
-        | "annotation-xml"
-        | "apply"
-        | "approx"
-        | "arccos"
-        | "arccosh"
-        | "arccot"
-        | "arccoth"
-        | "arccsc"
-        | "arccsch"
-        | "arcsec"
-        | "arcsech"
-        | "arcsin"
-        | "arcsinh"
-        | "arctan"
-        | "arctanh"
-        | "arg"
-        | "bind"
-        | "bvar"
-        | "card"
-        | "cartesianproduct"
-        | "cbytes"
-        | "ceiling"
-        | "cerror"
-        | "ci"
-        | "cn"
-        | "codomain"
-        | "complexes"
-        | "compose"
-        | "condition"
-        | "conjugate"
-        | "cos"
-        | "cosh"
-        | "cot"
-        | "coth"
-        | "cs"
-        | "csc"
-        | "csch"
-        | "csymbol"
-        | "curl"
-        | "declare"
-        | "degree"
-        | "determinant"
-        | "diff"
-        | "divergence"
-        | "divide"
-        | "domain"
-        | "domainofapplication"
-        | "emptyset"
-        | "eq"
-        | "equivalent"
-        | "eulergamma"
-        | "exists"
-        | "exp"
-        | "exponentiale"
-        | "factorial"
-        | "factorof"
-        | "false"
-        | "floor"
-        | "fn"
-        | "forall"
-        | "gcd"
-        | "geq"
-        | "grad"
-        | "gt"
-        | "ident"
-        | "image"
-        | "imaginary"
-        | "imaginaryi"
-        | "implies"
-        | "in"
-        | "infinity"
-        | "int"
-        | "integers"
-        | "intersect"
-        | "interval"
-        | "inverse"
-        | "lambda"
-        | "laplacian"
-        | "lcm"
-        | "leq"
-        | "limit"
-        | "list"
-        | "ln"
-        | "log"
-        | "logbase"
-        | "lowlimit"
-        | "lt"
-        | "maction"
-        | "maligngroup"
-        | "malignmark"
-        | "math"
-        | "matrix"
-        | "matrixrow"
-        | "max"
-        | "mean"
-        | "median"
-        | "menclose"
-        | "merror"
-        | "mfenced"
-        | "mfrac"
-        | "mglyph"
-        | "mi"
-        | "min"
-        | "minus"
-        | "mlabeledtr"
-        | "mlongdiv"
-        | "mmultiscripts"
-        | "mn"
-        | "mo"
-        | "mode"
-        | "moment"
-        | "momentabout"
-        | "mover"
-        | "mpadded"
-        | "mphantom"
-        | "mprescripts"
-        | "mroot"
-        | "mrow"
-        | "ms"
-        | "mscarries"
-        | "mscarry"
-        | "msgroup"
-        | "msline"
-        | "mspace"
-        | "msqrt"
-        | "msrow"
-        | "mstack"
-        | "mstyle"
-        | "msub"
-        | "msubsup"
-        | "msup"
-        | "mtable"
-        | "mtd"
-        | "mtext"
-        | "mtr"
-        | "munder"
-        | "munderover"
-        | "naturalnumbers"
-        | "neq"
-        | "none"
-        | "not"
-        | "notanumber"
-        | "notin"
-        | "notprsubset"
-        | "notsubset"
-        | "or"
-        | "otherwise"
-        | "outerproduct"
-        | "partialdiff"
-        | "pi"
-        | "piece"
-        | "piecewise"
-        | "plus"
-        | "power"
-        | "primes"
-        | "product"
-        | "prsubset"
-        | "quotient"
-        | "rationals"
-        | "real"
-        | "reals"
-        | "reln"
-        | "rem"
-        | "root"
-        | "scalarproduct"
-        | "sdev"
-        | "sec"
-        | "sech"
-        | "selector"
-        | "semantics"
-        | "sep"
-        | "set"
-        | "setdiff"
-        | "share"
-        | "sin"
-        | "sinh"
-        | "span"
-        | "subset"
-        | "sum"
-        | "tan"
-        | "tanh"
-        | "tendsto"
-        | "times"
-        | "transpose"
-        | "true"
-        | "union"
-        | "uplimit"
-        | "variance"
-        | "vector"
-        | "vectorproduct"
-        | "xor"
+            | "and"
+            | "annotation"
+            | "annotation-xml"
+            | "apply"
+            | "approx"
+            | "arccos"
+            | "arccosh"
+            | "arccot"
+            | "arccoth"
+            | "arccsc"
+            | "arccsch"
+            | "arcsec"
+            | "arcsech"
+            | "arcsin"
+            | "arcsinh"
+            | "arctan"
+            | "arctanh"
+            | "arg"
+            | "bind"
+            | "bvar"
+            | "card"
+            | "cartesianproduct"
+            | "cbytes"
+            | "ceiling"
+            | "cerror"
+            | "ci"
+            | "cn"
+            | "codomain"
+            | "complexes"
+            | "compose"
+            | "condition"
+            | "conjugate"
+            | "cos"
+            | "cosh"
+            | "cot"
+            | "coth"
+            | "cs"
+            | "csc"
+            | "csch"
+            | "csymbol"
+            | "curl"
+            | "declare"
+            | "degree"
+            | "determinant"
+            | "diff"
+            | "divergence"
+            | "divide"
+            | "domain"
+            | "domainofapplication"
+            | "emptyset"
+            | "eq"
+            | "equivalent"
+            | "eulergamma"
+            | "exists"
+            | "exp"
+            | "exponentiale"
+            | "factorial"
+            | "factorof"
+            | "false"
+            | "floor"
+            | "fn"
+            | "forall"
+            | "gcd"
+            | "geq"
+            | "grad"
+            | "gt"
+            | "ident"
+            | "image"
+            | "imaginary"
+            | "imaginaryi"
+            | "implies"
+            | "in"
+            | "infinity"
+            | "int"
+            | "integers"
+            | "intersect"
+            | "interval"
+            | "inverse"
+            | "lambda"
+            | "laplacian"
+            | "lcm"
+            | "leq"
+            | "limit"
+            | "list"
+            | "ln"
+            | "log"
+            | "logbase"
+            | "lowlimit"
+            | "lt"
+            | "maction"
+            | "maligngroup"
+            | "malignmark"
+            | "math"
+            | "matrix"
+            | "matrixrow"
+            | "max"
+            | "mean"
+            | "median"
+            | "menclose"
+            | "merror"
+            | "mfenced"
+            | "mfrac"
+            | "mglyph"
+            | "mi"
+            | "min"
+            | "minus"
+            | "mlabeledtr"
+            | "mlongdiv"
+            | "mmultiscripts"
+            | "mn"
+            | "mo"
+            | "mode"
+            | "moment"
+            | "momentabout"
+            | "mover"
+            | "mpadded"
+            | "mphantom"
+            | "mprescripts"
+            | "mroot"
+            | "mrow"
+            | "ms"
+            | "mscarries"
+            | "mscarry"
+            | "msgroup"
+            | "msline"
+            | "mspace"
+            | "msqrt"
+            | "msrow"
+            | "mstack"
+            | "mstyle"
+            | "msub"
+            | "msubsup"
+            | "msup"
+            | "mtable"
+            | "mtd"
+            | "mtext"
+            | "mtr"
+            | "munder"
+            | "munderover"
+            | "naturalnumbers"
+            | "neq"
+            | "none"
+            | "not"
+            | "notanumber"
+            | "notin"
+            | "notprsubset"
+            | "notsubset"
+            | "or"
+            | "otherwise"
+            | "outerproduct"
+            | "partialdiff"
+            | "pi"
+            | "piece"
+            | "piecewise"
+            | "plus"
+            | "power"
+            | "primes"
+            | "product"
+            | "prsubset"
+            | "quotient"
+            | "rationals"
+            | "real"
+            | "reals"
+            | "reln"
+            | "rem"
+            | "root"
+            | "scalarproduct"
+            | "sdev"
+            | "sec"
+            | "sech"
+            | "selector"
+            | "semantics"
+            | "sep"
+            | "set"
+            | "setdiff"
+            | "share"
+            | "sin"
+            | "sinh"
+            | "span"
+            | "subset"
+            | "sum"
+            | "tan"
+            | "tanh"
+            | "tendsto"
+            | "times"
+            | "transpose"
+            | "true"
+            | "union"
+            | "uplimit"
+            | "variance"
+            | "vector"
+            | "vectorproduct"
+            | "xor"
     )
 }
 
@@ -2631,9 +2692,10 @@ pub enum UrlRelative<'a> {
 impl<'a> UrlRelative<'a> {
     fn evaluate(&self, url: &str) -> Option<tendril::StrTendril> {
         match self {
-            UrlRelative::RewriteWithBase(ref url_base) => {
-                url_base.join(url).ok().and_then(|x| StrTendril::from_str(x.as_str()).ok())
-            }
+            UrlRelative::RewriteWithBase(ref url_base) => url_base
+                .join(url)
+                .ok()
+                .and_then(|x| StrTendril::from_str(x.as_str()).ok()),
             UrlRelative::RewriteWithRoot { ref root, ref path } => {
                 (match url.as_bytes() {
                     // Scheme-relative URL
@@ -2643,16 +2705,16 @@ impl<'a> UrlRelative<'a> {
                     [b'/', ..] => root.join(&url[1..]),
                     // Path-relative URL
                     _ => root.join(path).and_then(|r| r.join(url)),
-                }).ok().and_then(|x| StrTendril::from_str(x.as_str()).ok())
+                })
+                .ok()
+                .and_then(|x| StrTendril::from_str(x.as_str()).ok())
             }
-            UrlRelative::Custom(ref evaluate) => {
-                evaluate
-                    .evaluate(&*url)
-                    .as_ref()
-                    .map(Cow::as_ref)
-                    .map(StrTendril::from_str)
-                    .and_then(Result::ok)
-            }
+            UrlRelative::Custom(ref evaluate) => evaluate
+                .evaluate(&*url)
+                .as_ref()
+                .map(Cow::as_ref)
+                .map(StrTendril::from_str)
+                .and_then(Result::ok),
             UrlRelative::PassThrough => StrTendril::from_str(url).ok(),
             UrlRelative::Deny => None,
         }
@@ -2668,7 +2730,10 @@ impl<'a> fmt::Debug for UrlRelative<'a> {
                 write!(f, "UrlRelative::RewriteWithBase({})", base)
             }
             UrlRelative::RewriteWithRoot { ref root, ref path } => {
-                write!(f, "UrlRelative::RewriteWithRoot {{ root: {root}, path: {path} }}")
+                write!(
+                    f,
+                    "UrlRelative::RewriteWithRoot {{ root: {root}, path: {path} }}"
+                )
             }
             UrlRelative::Custom(_) => write!(f, "UrlRelative::Custom"),
         }
@@ -2701,6 +2766,12 @@ impl fmt::Debug for dyn AttributeFilter {
     }
 }
 
+impl fmt::Debug for dyn AttributeBreaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AttributeBreaker")
+    }
+}
+
 /// Types that implement this trait can be used to remove or rewrite arbitrary attributes.
 ///
 /// See [`attribute_filter`][attribute_filter] for more details.
@@ -2711,11 +2782,35 @@ pub trait AttributeFilter: Send + Sync {
     fn filter<'a>(&self, _: &str, _: &str, _: &'a str) -> Option<Cow<'a, str>>;
 }
 
+/// Types that implement this trait can be used to stop parse and return errors.
+///
+/// See [`attribute_breaker`][attribute_breaker] for more details.
+///
+/// [attribute_breaker]: struct.Builder.html#method.attribute_breaker
+pub trait AttributeBreaker: Send + Sync {
+    /// Return `None` to remove the attribute. Return `Some(str)` to replace it with a new string.
+    fn filter<'a>(&self, _: &str, _: &str, _: &'a str) -> Result<(), &'static str>;
+}
+
 impl<T> AttributeFilter for T
 where
     T: for<'a> Fn(&str, &str, &'a str) -> Option<Cow<'a, str>> + Send + Sync + 'static,
 {
     fn filter<'a>(&self, element: &str, attribute: &str, value: &'a str) -> Option<Cow<'a, str>> {
+        self(element, attribute, value)
+    }
+}
+
+impl<T> AttributeBreaker for T
+where
+    T: for<'a> Fn(&str, &str, &'a str) -> Result<(), &'static str> + Send + Sync + 'static,
+{
+    fn filter<'a>(
+        &self,
+        element: &str,
+        attribute: &str,
+        value: &'a str,
+    ) -> Result<(), &'static str> {
         self(element, attribute, value)
     }
 }
@@ -3810,11 +3905,17 @@ mod test {
             let h = format!(r#"<a href="{url}">test</a>"#);
             let r = format!(r#"<a href="{result}" rel="noopener noreferrer">test</a>"#);
             let a = Builder::new()
-                .url_relative(UrlRelative::RewriteWithRoot { root: Url::parse(root).unwrap(), path: path.to_string() })
+                .url_relative(UrlRelative::RewriteWithRoot {
+                    root: Url::parse(root).unwrap(),
+                    path: path.to_string(),
+                })
                 .clean(&h)
                 .to_string();
             if r != a {
-                println!("failed to check ({root}, {path}, {url}, {result})\n{r} != {a}", r = r);
+                println!(
+                    "failed to check ({root}, {path}, {url}, {result})\n{r} != {a}",
+                    r = r
+                );
                 assert_eq!(r, a);
             }
         }
